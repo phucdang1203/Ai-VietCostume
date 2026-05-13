@@ -1,176 +1,89 @@
-# =========================================================
-# FILE:
 # app/pipeline/photomaker_generation_service.py
-#
-# MỤC TIÊU:
-# - Không load sai TencentARC/PhotoMaker-V2 như DiffusionPipeline trực tiếp
-# - Dùng SDXL Base model chạy trước
-# - Sẵn sàng nâng cấp sang PhotoMaker adapter sau
-# - Chạy được local + Kaggle
-# =========================================================
 
 import torch
+import os
 from pathlib import Path
+from diffusers.utils import load_image
+from huggingface_hub import hf_hub_download
 
-# =========================================================
-# TẠM THỜI:
-# Dùng StableDiffusionXLPipeline base
-# =========================================================
-from diffusers import StableDiffusionXLPipeline
-
-from app.core.model_registry import (
-    ModelRegistry
-)
-
+# Import pipeline chuyên dụng cho PhotoMaker
+from photomaker import PhotoMakerStableDiffusionXLPipeline
 
 class PhotoMakerGenerationService:
     def __init__(self):
-
-        # =================================================
-        # DEVICE
-        # =================================================
-        self.device = (
-            ModelRegistry.get_device()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        
+        # 1. Đường dẫn Model
+        # Kaggle: /kaggle/input/stable-diffusion-xl-base-1.0
+        self.base_model = os.getenv("MODEL_PATH", "stabilityai/stable-diffusion-xl-base-1.0")
+        
+        # Đường dẫn tới file photomaker-v2.bin (Adapter)
+        # Bạn có thể để trong Kaggle Dataset hoặc tải tự động từ HF
+        self.photomaker_path = hf_hub_download(
+            repo_id="TencentARC/PhotoMaker-V2", 
+            filename="photomaker-v2.bin", 
+            repo_type="model"
         )
 
-        # =================================================
-        # DTYPE
-        # =================================================
-        self.dtype = (
-            torch.float16
-            if self.device == "cuda"
-            else torch.float32
+        # 2. Khởi tạo Pipeline
+        print(f"--- Loading PhotoMaker V2 with Base: {self.base_model} ---")
+        self.pipe = PhotoMakerStableDiffusionXLPipeline.from_pretrained(
+            self.base_model,
+            torch_dtype=self.dtype,
+            use_safetensors=True,
+            variant="fp16"
+        ).to(self.device)
+
+        # 3. Load PhotoMaker Adapter
+        self.pipe.load_photomaker_adapter(
+            os.path.dirname(self.photomaker_path),
+            subfolder="",
+            weight_name=os.path.basename(self.photomaker_path),
+            trigger_word="img"  # Rất quan trọng: từ khóa kích hoạt PhotoMaker
         )
 
-        # =================================================
-        # BASE MODEL
-        # KHÔNG dùng:
-        # TencentARC/PhotoMaker-V2 trực tiếp
-        # =================================================
-        self.base_model = (
-            ModelRegistry.get_base_model()
-        )
+        # 4. Tối ưu hóa cho T4 GPU (16GB VRAM)
+        if self.device == "cuda":
+            self.pipe.enable_model_cpu_offload() # Di chuyển các phần không dùng về RAM
+            self.pipe.enable_vae_tiling()        # Xử lý ảnh kích thước lớn không tràn VRAM
 
-        # =================================================
-        # LOAD BASE SDXL PIPELINE
-        # =================================================
-        self.pipe = (
-            StableDiffusionXLPipeline
-            .from_pretrained(
-                self.base_model,
-                torch_dtype=self.dtype,
-                use_safetensors=True
+    def generate(self, prompt_data: dict, input_image, output_path: str):
+        """
+        input_image: PIL Image từ FaceService
+        """
+        # PhotoMaker yêu cầu danh sách các ảnh khuôn mặt (ở đây ta dùng 1 ảnh)
+        input_id_images = [input_image]
+        
+        # Lấy prompt và đảm bảo có từ khóa 'img' phía sau chủ thể
+        # Ví dụ: "A photo of a man img, wearing Vietnamese costume..."
+        raw_prompt = prompt_data.get("prompt", "")
+        negative_prompt = prompt_data.get("negative_prompt", "asymmetry, worst quality, low quality, cartoon, anime")
+
+        # Thiết lập Generator để kết quả ổn định
+        generator = torch.Generator(device=self.device).manual_seed(42)
+
+        print(f"--- Generating with prompt: {raw_prompt} ---")
+        
+        with torch.inference_mode():
+            # Gọi pipeline với các tham số đặc thù của PhotoMaker
+            result = self.pipe(
+                prompt=raw_prompt,
+                input_id_images=input_id_images,
+                negative_prompt=negative_prompt,
+                num_inference_steps=30,
+                guidance_scale=5.0, # PhotoMaker thường đẹp ở tầm 3.0 - 5.0
+                generator=generator,
+                start_merge_step=10 # Bước bắt đầu trộn ID
             )
-        )
-
-        # =================================================
-        # MOVE DEVICE
-        # =================================================
-        self.pipe = self.pipe.to(
-            self.device
-        )
-
-        # =================================================
-        # MEMORY SAFE
-        # =================================================
-        try:
-            self.pipe.enable_attention_slicing()
-        except:
-            pass
-
-        # =================================================
-        # OPTIONAL FUTURE:
-        # Nếu sau này clone official PhotoMaker:
-        #
-        # self.pipe.load_photomaker_adapter(...)
-        # =================================================
-
-    def generate(
-        self,
-        prompt_data: dict,
-        input_image,
-        output_path: str
-    ):
-
-        # =================================================
-        # NOTE:
-        # Hiện tại input_image chưa được dùng trực tiếp
-        # vì bản này là SDXL skeleton trước
-        #
-        # Giai đoạn sau:
-        # input_image => PhotoMaker adapter
-        # =================================================
-
-        result = self.pipe(
-            prompt=prompt_data[
-                "prompt"
-            ],
-
-            negative_prompt=prompt_data.get(
-                "negative_prompt",
-                None
-            ),
-
-            num_inference_steps=30,
-
-            guidance_scale=7.5
-        )
 
         image = result.images[0]
-
-        # =================================================
-        # SAVE
-        # =================================================
-        output_file = Path(
-            output_path
-        )
-
-        output_file.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         image.save(output_file)
 
-        # =================================================
-        # RESPONSE
-        # =================================================
         return {
-            "output_file": str(
-                output_file
-            ),
-
-            "prompt": prompt_data[
-                "prompt"
-            ],
-
-            "negative_prompt": prompt_data.get(
-                "negative_prompt"
-            ),
-
-            "occupation": prompt_data[
-                "occupation"
-            ],
-
-            "age_group": prompt_data.get(
-                "age_group"
-            ),
-
-            "gender": prompt_data.get(
-                "gender"
-            ),
-
-            # =================================================
-            # Trạng thái rõ ràng:
-            # Chưa phải full PhotoMaker identity injection
-            # =================================================
-            "mode": (
-                "SDXL_BASE_ONLY"
-            ),
-
-            "next_upgrade": [
-                "Install official PhotoMaker repo",
-                "Load PhotoMaker adapter",
-                "Inject face identity image"
-            ]
+            "output_file": str(output_file),
+            "mode": "PHOTOMAKER_V2_ACTIVE",
+            "prompt_used": raw_prompt
         }
