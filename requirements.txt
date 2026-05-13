@@ -1,0 +1,20 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+diffusers
+transformers
+torch
+accelerate
+python-dotenv
+logging
+insightface
+deepface
+retinaface
+huggingface_hub
+peft
+# ip-adapter
+onnxruntime
+onnxruntime-gpu
+opencv-python
+# einops
